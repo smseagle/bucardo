@@ -762,69 +762,8 @@ sub start_mcp {
     ## Let any listeners know we have gotten this far
     $self->db_notify($masterdbh, 'started', 1);
 
-    ## For optimization later on, we need to know which syncs are 'fullcopy'
-    for my $syncname (keys %{ $self->{sync} }) {
-
-        my $s = $self->{sync}{$syncname};
-
-        ## Skip inactive or paused syncs
-        next if !$s->{mcp_active} or $s->{paused};
-
-        ## Walk through each database and check the roles, discarding inactive dbs
-        my %rolecount;
-        for my $db (values %{ $s->{db} }) {
-            next if $db->{status} ne 'active';
-            $rolecount{$db->{role}}++;
-        }
-
-        ## Default to being fullcopy
-        $s->{fullcopy} = 1;
-
-        ## We cannot be a fullcopy sync if:
-        if ($rolecount{'target'}           ## there are any target dbs
-            or $rolecount{'source'} > 1    ## there is more than one source db
-            or ! $rolecount{'fullcopy'}) { ## there are no fullcopy dbs
-            $s->{fullcopy} = 0;
-        }
-    }
-
-
-    ## Because a sync may have gotten a notice while we were down,
-    ## we auto-kick all eligible syncs
-    ## We also need to see if we can prevent the VAC daemon from running,
-    ## if there are no databases with bucardo schemas
-    $self->{needsvac} = 0;
-    for my $syncname (keys %{ $self->{sync} }) {
-
-        my $s = $self->{sync}{$syncname};
-
-        ## Default to starting in a non-kicked mode
-        $s->{kick_on_startup} = 0;
-
-        ## Skip inactive or paused syncs
-        next if  !$s->{mcp_active} or $s->{paused};
-
-        ## Skip fullcopy syncs
-        next if $s->{fullcopy};
-
-        ## Right now, the vac daemon is only useful for source Postgres databases
-        ## Of course, it is not needed for fullcopy syncs
-        for my $db (values %{ $s->{db} }) {
-            if ($db->{status} eq 'active'
-                and $db->{dbtype} eq 'postgres'
-                and $db->{role} eq 'source') {
-                ## We need to increment it for any matches in sdb, regardless of which sync initially set it!
-                $self->{sdb}{ $db->{name} }{needsvac} = 2;
-                $self->{needsvac} = 1;
-            }
-        }
-
-        ## Skip if autokick is false
-        next if ! $s->{autokick};
-
-        ## Kick it!
-        $s->{kick_on_startup} = 1;
-    }
+    ## Work out fullcopy and auto-kick flags for the loaded syncs
+    $self->flag_loaded_syncs();
 
     ## Start the main loop
     {
@@ -938,6 +877,9 @@ sub mcp_main {
             ## This message must have "Ping failed" to match the $respawn above
             $maindbh->ping or die qq{Ping failed for main database!\n};
 
+            ## How many databases came back from a stalled state during this check
+            my $restored_dbs = 0;
+
             ## Check each (pingable) remote database in undefined order
             for my $dbname (keys %{ $self->{sdb} }) {
 
@@ -967,6 +909,7 @@ sub mcp_main {
                     }
                     if (defined $d->{backend}) {
                         $self->show_db_version_and_time($d->{dbh}, $d->{backend}, qq{Database "$dbname" });
+                        $restored_dbs++ if $d->{status} eq 'stalled';
                         $d->{status} = 'active'; ## In case it was stalled
                     }
                     else {
@@ -974,6 +917,24 @@ sub mcp_main {
                         ## We may want to throw an exception if this keeps happening
                         ## We may also want to adjust lastpingcheck so we check more often
                     }
+                }
+            }
+
+            ## A database that was unreachable is back. A sync that failed validation while it
+            ## was down is only inactive in memory (bucardo.sync still says active), and nothing
+            ## else retries it until the next reload, so do the reload now.
+            if ($restored_dbs) {
+                my @inactive = grep {
+                    ! $self->{sync}{$_}{mcp_active}
+                    and $self->{sync}{$_}{status} =~ /^(?:active|stalled)$/
+                } keys %{ $self->{sync} };
+                if (@inactive) {
+                    $self->glog(qq{Database restored, reloading MCP to retry syncs: @{[ join ',' => sort @inactive ]}}, LOG_NORMAL);
+                    my $active = $self->reload_mcp();
+                    ## reload_mcp clears kick_on_startup, but the changes made while the database
+                    ## was down are still waiting, so kick the syncs like a fresh start would
+                    $self->flag_loaded_syncs();
+                    $self->glog("Active syncs after reload: $active", LOG_TERSE);
                 }
             }
 
@@ -7970,6 +7931,84 @@ sub reset_mcp_listeners {
     return;
 
 } ## end of reset_mcp_listeners
+
+
+sub flag_loaded_syncs {
+
+    ## Set the fullcopy flag, the vac hint and kick_on_startup for every loaded sync
+    ## Called after start_mcp loads the syncs, and after a reload that retried stalled syncs
+    ## Arguments: none
+    ## Returns: nothing
+
+    my $self = shift;
+
+    ## For optimization later on, we need to know which syncs are 'fullcopy'
+    for my $syncname (keys %{ $self->{sync} }) {
+
+        my $s = $self->{sync}{$syncname};
+
+        ## Skip inactive or paused syncs
+        next if !$s->{mcp_active} or $s->{paused};
+
+        ## Walk through each database and check the roles, discarding inactive dbs
+        my %rolecount;
+        for my $db (values %{ $s->{db} }) {
+            next if $db->{status} ne 'active';
+            $rolecount{$db->{role}}++;
+        }
+
+        ## Default to being fullcopy
+        $s->{fullcopy} = 1;
+
+        ## We cannot be a fullcopy sync if:
+        if ($rolecount{'target'}           ## there are any target dbs
+            or $rolecount{'source'} > 1    ## there is more than one source db
+            or ! $rolecount{'fullcopy'}) { ## there are no fullcopy dbs
+            $s->{fullcopy} = 0;
+        }
+    }
+
+
+    ## Because a sync may have gotten a notice while we were down,
+    ## we auto-kick all eligible syncs
+    ## We also need to see if we can prevent the VAC daemon from running,
+    ## if there are no databases with bucardo schemas
+    $self->{needsvac} = 0;
+    for my $syncname (keys %{ $self->{sync} }) {
+
+        my $s = $self->{sync}{$syncname};
+
+        ## Default to starting in a non-kicked mode
+        $s->{kick_on_startup} = 0;
+
+        ## Skip inactive or paused syncs
+        next if  !$s->{mcp_active} or $s->{paused};
+
+        ## Skip fullcopy syncs
+        next if $s->{fullcopy};
+
+        ## Right now, the vac daemon is only useful for source Postgres databases
+        ## Of course, it is not needed for fullcopy syncs
+        for my $db (values %{ $s->{db} }) {
+            if ($db->{status} eq 'active'
+                and $db->{dbtype} eq 'postgres'
+                and $db->{role} eq 'source') {
+                ## We need to increment it for any matches in sdb, regardless of which sync initially set it!
+                $self->{sdb}{ $db->{name} }{needsvac} = 2;
+                $self->{needsvac} = 1;
+            }
+        }
+
+        ## Skip if autokick is false
+        next if ! $s->{autokick};
+
+        ## Kick it!
+        $s->{kick_on_startup} = 1;
+    }
+
+    return;
+
+} ## end of flag_loaded_syncs
 
 
 sub reload_mcp {
